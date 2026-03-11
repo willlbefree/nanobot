@@ -188,9 +188,10 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         
-        # Tool call deduplication tracking
-        _tool_call_history: list[tuple[str, str]] = []  # (name, args_hash)
-        _MAX_DUPLICATE_COUNT = 3
+        # Tool call deduplication tracking - detect "no progress" patterns
+        _tool_call_history: list[tuple[str, str, str]] = []  # (name, args_hash, result_hash)
+        _MAX_DUPLICATE_COUNT = 5  # Allow more repeats for legitimate pagination
+        _MAX_SAME_RESULT_COUNT = 3  # Trigger stop only when result is identical
         _HISTORY_WINDOW = 10
 
         while iteration < self.max_iterations:
@@ -234,30 +235,42 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     
-                    # Tool call deduplication check
+                    # Execute tool first to get result
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # Tool call deduplication check - based on "no progress" pattern
                     args_hash = f"{tool_call.name}:{args_str}"
-                    _tool_call_history.append((tool_call.name, args_hash))
+                    result_hash = hash(result) if result else "none"
+                    _tool_call_history.append((tool_call.name, args_hash, result_hash))
                     if len(_tool_call_history) > _HISTORY_WINDOW:
                         _tool_call_history.pop(0)
                     
-                    # Count duplicates in recent history
-                    duplicate_count = sum(1 for _, h in _tool_call_history if h == args_hash)
-                    if duplicate_count >= _MAX_DUPLICATE_COUNT:
-                        logger.warning("Detected {} duplicate calls to {} with same arguments. Breaking loop.", duplicate_count, tool_call.name)
+                    # Count calls with same args AND same result (true "no progress")
+                    same_call_count = sum(1 for n, a, r in _tool_call_history 
+                                         if n == tool_call.name and a == args_hash)
+                    same_result_count = sum(1 for n, a, r in _tool_call_history 
+                                           if n == tool_call.name and a == args_hash and r == result_hash)
+                    
+                    # Only trigger when both args and result are identical (real loop)
+                    if same_call_count >= _MAX_DUPLICATE_COUNT and same_result_count >= _MAX_SAME_RESULT_COUNT:
+                        logger.warning(
+                            "Detected loop: {} calls to {} with same args, {} with same result. Breaking.",
+                            same_call_count, tool_call.name, same_result_count
+                        )
                         final_content = (
-                            f"⚠️ **检测到循环**：连续 {duplicate_count} 次调用相同的工具（{tool_call.name}）。"
-                            f"\n\n这可能是以下原因导致的："
-                            f"\n1. 目标代码不存在（如尝试编辑不存在的函数）"
-                            f"\n2. 工具调用参数错误"
-                            f"\n3. LLM 陷入重复模式"
-                            f"\n\n建议："
-                            f"\n- 检查目标是否存在"
-                            f"\n- 明确指定修改意图"
-                            f"\n- 使用 /new 开始新会话"
+                            f"⚠️ **检测到循环**：连续 {same_call_count} 次调用 {tool_call.name}，"
+                            f"其中 {same_result_count} 次返回了相同的结果。\n\n"
+                            f"这可能是因为：\n"
+                            f"1. 目标不存在（如尝试编辑不存在的函数/文件）\n"
+                            f"2. 操作失败但 LLM 未意识到\n"
+                            f"3. LLM 陷入重复模式\n\n"
+                            f"建议：\n"
+                            f"- 检查目标是否存在\n"
+                            f"- 明确指定修改意图\n"
+                            f"- 使用 /new 开始新会话"
                         )
                         break
                     
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
